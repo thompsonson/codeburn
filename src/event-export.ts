@@ -7,6 +7,7 @@ import { discoverAllSessions } from './providers/index.js'
 import {
   DENIAL_RE,
   SIBLING_CASCADE_RE,
+  extractInlineCorrection,
   isToolResultBlock,
   toolResultText,
   truncateCorrectionText,
@@ -190,6 +191,7 @@ export async function exportEvents(opts: ExportEventsOptions): Promise<{ path: s
             const text = toolResultText(b.content)
             const toolName = b.tool_use_id ? toolNameById.get(b.tool_use_id) : undefined
             if (DENIAL_RE.test(text)) {
+              const inlineCorrection = extractInlineCorrection(text)
               await writeRecord({
                 session_id: sessionId,
                 timestamp: ts,
@@ -200,8 +202,12 @@ export async function exportEvents(opts: ExportEventsOptions): Promise<{ path: s
                 tool_use_id: b.tool_use_id,
                 tool_name: toolName,
                 denial_reason: text,
+                correction_text: inlineCorrection ? truncateCorrectionText(inlineCorrection) : undefined,
               })
-              pendingDenial = { sessionId, project, gitBranch, timestamp: ts, tool: toolName, reason: text }
+              // Only watch for a follow-up correction if the denial didn't carry one inline.
+              pendingDenial = inlineCorrection
+                ? null
+                : { sessionId, project, gitBranch, timestamp: ts, tool: toolName, reason: text }
               continue
             }
             const isError = !!b.is_error

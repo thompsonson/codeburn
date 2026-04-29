@@ -72,3 +72,15 @@ export const MAX_CORRECTION_TEXT_LEN = 4000
 export function truncateCorrectionText(text: string, max = MAX_CORRECTION_TEXT_LEN): string {
   return text.length > max ? text.slice(0, max) + '…' : text
 }
+
+// Some denial tool_result payloads inline the user's correction after a
+// "the user said:" marker (curly or straight quote). Extract that text so
+// downstream consumers see the correction without needing the next user turn.
+const INLINE_CORRECTION_RE = /the user said:\s*\n?([\s\S]+)$/i
+
+export function extractInlineCorrection(denialText: string): string | undefined {
+  const m = denialText.match(INLINE_CORRECTION_RE)
+  if (!m) return undefined
+  const t = m[1].trim()
+  return t ? t : undefined
+}
