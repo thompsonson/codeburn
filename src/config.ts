@@ -20,6 +20,39 @@ export type CodeburnConfig = {
   }
   plan?: Plan
   modelAliases?: Record<string, string>
+  branchLabels?: Record<string, string>
+}
+
+const DEFAULT_BRANCH_LABELS: Record<string, string> = {
+  'ci/': 'CI',
+  'docs/adr': 'ADR',
+  'feat/': 'Feature',
+  'feature/': 'Feature',
+  'fix/': 'Fix',
+  'bugfix/': 'Fix',
+  'docs/': 'Docs',
+  'test/': 'Tests',
+  'tests/': 'Tests',
+  'refactor/': 'Refactor',
+  'chore/': 'Chore',
+  'release/': 'Release',
+}
+
+export function resolveBranchLabels(config?: CodeburnConfig): Record<string, string> {
+  return config?.branchLabels ?? DEFAULT_BRANCH_LABELS
+}
+
+// Longest-pattern wins so `docs/adr` beats `docs/`. Returns undefined when
+// nothing matches; callers decide whether to fall back to "Other".
+export function getBranchLabel(branch: string | undefined, labels: Record<string, string>): string | undefined {
+  if (!branch) return undefined
+  const sorted = Object.keys(labels).sort((a, b) => b.length - a.length)
+  for (const pattern of sorted) {
+    if (branch.startsWith(pattern) || branch === pattern.replace(/\/$/, '')) {
+      return labels[pattern]
+    }
+  }
+  return undefined
 }
 
 function getConfigDir(): string {

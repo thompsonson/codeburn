@@ -4,6 +4,7 @@ import { dirname, join, resolve } from 'path'
 import { CATEGORY_LABELS, type ProjectSummary, type TaskCategory } from './types.js'
 import { getCurrency, convertCost } from './currency.js'
 import { dateKey } from './day-aggregator.js'
+import { getBranchLabel, resolveBranchLabels, type CodeburnConfig } from './config.js'
 
 function escCsv(s: string): string {
   const sanitized = /^[\t\r=+\-@]/.test(s) ? `'${s}` : s
@@ -137,21 +138,52 @@ function buildModelRows(projects: ProjectSummary[], period: string): Row[] {
 }
 
 function buildToolRows(projects: ProjectSummary[]): Row[] {
-  const toolTotals: Record<string, number> = {}
+  type ToolAgg = { calls: number; errors: number; denials: number; siblingCascade: number }
+  const toolTotals: Record<string, ToolAgg> = {}
   for (const project of projects) {
     for (const session of project.sessions) {
       for (const [tool, d] of Object.entries(session.toolBreakdown)) {
-        toolTotals[tool] = (toolTotals[tool] ?? 0) + d.calls
+        const agg = toolTotals[tool] ?? { calls: 0, errors: 0, denials: 0, siblingCascade: 0 }
+        agg.calls += d.calls
+        agg.errors += d.errors ?? 0
+        agg.denials += d.denials ?? 0
+        agg.siblingCascade += d.siblingCascadeErrors ?? 0
+        toolTotals[tool] = agg
       }
     }
   }
-  const total = Object.values(toolTotals).reduce((s, n) => s + n, 0)
+  const total = Object.values(toolTotals).reduce((s, d) => s + d.calls, 0)
   return Object.entries(toolTotals)
-    .sort(([, a], [, b]) => b - a)
-    .map(([tool, calls]) => ({
+    .sort(([, a], [, b]) => b.calls - a.calls)
+    .map(([tool, d]) => ({
       Tool: tool,
-      Calls: calls,
-      'Share (%)': pct(calls, total),
+      Calls: d.calls,
+      'Share (%)': pct(d.calls, total),
+      Errors: d.errors,
+      'Error Rate (%)': pct(d.errors, d.calls),
+      Denials: d.denials,
+      'Sibling Cascade Errors': d.siblingCascade,
+    }))
+}
+
+function buildErrorPatternRows(projects: ProjectSummary[]): Row[] {
+  const patterns = new Map<string, { tool: string; signature: string; count: number; example: string }>()
+  for (const project of projects) {
+    for (const session of project.sessions) {
+      for (const p of session.errorPatterns ?? []) {
+        const existing = patterns.get(p.signature)
+        if (existing) existing.count += p.count
+        else patterns.set(p.signature, { ...p })
+      }
+    }
+  }
+  return [...patterns.values()]
+    .sort((a, b) => b.count - a.count)
+    .map(p => ({
+      Tool: p.tool,
+      Count: p.count,
+      Signature: p.signature,
+      Example: p.example,
     }))
 }
 
@@ -190,7 +222,7 @@ function buildProjectRows(projects: ProjectSummary[]): Row[] {
     }))
 }
 
-function buildSessionRows(projects: ProjectSummary[]): Row[] {
+function buildSessionRows(projects: ProjectSummary[], branchLabels: Record<string, string>): Row[] {
   const { code } = getCurrency()
   const rows: Row[] = []
   for (const p of projects) {
@@ -199,6 +231,8 @@ function buildSessionRows(projects: ProjectSummary[]): Row[] {
         Project: p.projectPath,
         'Session ID': s.sessionId,
         'Started At': s.firstTimestamp ?? '',
+        Branch: s.gitBranch ?? '',
+        'Branch Label': getBranchLabel(s.gitBranch, branchLabels) ?? '',
         [`Cost (${code})`]: round2(convertCost(s.totalCostUSD)),
         'API Calls': s.apiCalls,
         Turns: s.turns.length,
@@ -206,6 +240,33 @@ function buildSessionRows(projects: ProjectSummary[]): Row[] {
     }
   }
   return rows.sort((a, b) => (b[`Cost (${code})`] as number) - (a[`Cost (${code})`] as number))
+}
+
+function buildBranchActivityRows(projects: ProjectSummary[], branchLabels: Record<string, string>): Row[] {
+  type Agg = { cost: number; sessions: number; calls: number }
+  const totals: Record<string, Agg> = {}
+  for (const p of projects) {
+    for (const s of p.sessions) {
+      if (!s.gitBranch) continue
+      const label = getBranchLabel(s.gitBranch, branchLabels) ?? 'Other'
+      const agg = totals[label] ?? { cost: 0, sessions: 0, calls: 0 }
+      agg.cost += s.totalCostUSD
+      agg.sessions++
+      agg.calls += s.apiCalls
+      totals[label] = agg
+    }
+  }
+  const totalCost = Object.values(totals).reduce((s, d) => s + d.cost, 0)
+  const { code } = getCurrency()
+  return Object.entries(totals)
+    .sort(([, a], [, b]) => b.cost - a.cost)
+    .map(([label, d]) => ({
+      'Branch Label': label,
+      [`Cost (${code})`]: round2(convertCost(d.cost)),
+      'Share (%)': pct(d.cost, totalCost),
+      Sessions: d.sessions,
+      'API Calls': d.calls,
+    }))
 }
 
 export type PeriodExport = {
@@ -249,7 +310,9 @@ function buildReadme(periods: PeriodExport[]): string {
     '  models.csv            Spend per model with token totals and cache usage.',
     '  projects.csv          Spend per project folder (30-day window).',
     '  sessions.csv          One row per session (30-day window) with session IDs and costs.',
-    '  tools.csv             Tool invocations and share (30-day window).',
+    '  tools.csv             Tool invocations, error rate, denials (30-day window).',
+    '  errors.csv            Top tool error patterns with example messages (30-day window).',
+    '  branch-activity.csv   Spend grouped by git branch label (CI / Feature / Fix / etc.).',
     '  shell-commands.csv    Shell commands executed via Bash tool (30-day window).',
     '',
     'Notes',
@@ -281,9 +344,14 @@ async function clearCodeburnExportFolder(path: string): Promise<void> {
 /// ends in `.csv` the extension is stripped to form the folder name. Refuses to delete a
 /// pre-existing file or a non-codeburn folder, so a typo like `-o ~/.ssh/id_ed25519` can't
 /// wipe a sensitive file (prior versions did `rm(path, { force: true })` unconditionally).
-export async function exportCsv(periods: PeriodExport[], outputPath: string): Promise<string> {
+export type ExportOptions = {
+  config?: CodeburnConfig
+}
+
+export async function exportCsv(periods: PeriodExport[], outputPath: string, opts: ExportOptions = {}): Promise<string> {
   const thirtyDays = periods.find(p => p.label === '30 Days')
   const thirtyDayProjects = thirtyDays?.projects ?? periods[periods.length - 1]?.projects ?? []
+  const branchLabels = resolveBranchLabels(opts.config)
 
   let folder = resolve(outputPath)
   if (folder.toLowerCase().endsWith('.csv')) {
@@ -316,17 +384,20 @@ export async function exportCsv(periods: PeriodExport[], outputPath: string): Pr
   await writeFile(join(folder, 'activity.csv'), rowsToCsv(activityRows), 'utf-8')
   await writeFile(join(folder, 'models.csv'), rowsToCsv(modelRows), 'utf-8')
   await writeFile(join(folder, 'projects.csv'), rowsToCsv(buildProjectRows(thirtyDayProjects)), 'utf-8')
-  await writeFile(join(folder, 'sessions.csv'), rowsToCsv(buildSessionRows(thirtyDayProjects)), 'utf-8')
+  await writeFile(join(folder, 'sessions.csv'), rowsToCsv(buildSessionRows(thirtyDayProjects, branchLabels)), 'utf-8')
   await writeFile(join(folder, 'tools.csv'), rowsToCsv(buildToolRows(thirtyDayProjects)), 'utf-8')
+  await writeFile(join(folder, 'errors.csv'), rowsToCsv(buildErrorPatternRows(thirtyDayProjects)), 'utf-8')
+  await writeFile(join(folder, 'branch-activity.csv'), rowsToCsv(buildBranchActivityRows(thirtyDayProjects, branchLabels)), 'utf-8')
   await writeFile(join(folder, 'shell-commands.csv'), rowsToCsv(buildBashRows(thirtyDayProjects)), 'utf-8')
 
   return folder
 }
 
-export async function exportJson(periods: PeriodExport[], outputPath: string): Promise<string> {
+export async function exportJson(periods: PeriodExport[], outputPath: string, opts: ExportOptions = {}): Promise<string> {
   const thirtyDays = periods.find(p => p.label === '30 Days')
   const thirtyDayProjects = thirtyDays?.projects ?? periods[periods.length - 1]?.projects ?? []
   const { code, rate, symbol } = getCurrency()
+  const branchLabels = resolveBranchLabels(opts.config)
 
   const data = {
     schema: 'codeburn.export.v2',
@@ -340,8 +411,10 @@ export async function exportJson(periods: PeriodExport[], outputPath: string): P
       models: buildModelRows(p.projects, p.label),
     })),
     projects: buildProjectRows(thirtyDayProjects),
-    sessions: buildSessionRows(thirtyDayProjects),
+    sessions: buildSessionRows(thirtyDayProjects, branchLabels),
     tools: buildToolRows(thirtyDayProjects),
+    errors: buildErrorPatternRows(thirtyDayProjects),
+    branchActivity: buildBranchActivityRows(thirtyDayProjects, branchLabels),
     shellCommands: buildBashRows(thirtyDayProjects),
   }
 

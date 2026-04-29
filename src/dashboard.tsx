@@ -5,6 +5,7 @@ import { render, Box, Text, useInput, useApp, useWindowSize } from 'ink'
 import { CATEGORY_LABELS, type DateRange, type ProjectSummary, type TaskCategory } from './types.js'
 import { formatCost, formatTokens } from './format.js'
 import { parseAllSessions, filterProjectsByName } from './parser.js'
+import { readConfig, resolveBranchLabels, getBranchLabel } from './config.js'
 import { loadPricing } from './models.js'
 import { getAllProviders } from './providers/index.js'
 import { scanAndDetect, type WasteFinding, type WasteAction, type OptimizeResult } from './optimize.js'
@@ -53,6 +54,7 @@ const PANEL_COLORS = {
   tools: '#5BF5E0',
   mcp: '#F55BE0',
   bash: '#F5A05B',
+  errors: '#F55B5B',
 }
 
 const PROVIDER_COLORS: Record<string, string> = {
@@ -387,32 +389,119 @@ function ActivityBreakdown({ projects, pw, bw }: { projects: ProjectSummary[]; p
 }
 
 function ToolBreakdown({ projects, pw, bw, title, filterPrefix }: { projects: ProjectSummary[]; pw: number; bw: number; title?: string; filterPrefix?: string }) {
-  const toolTotals: Record<string, number> = {}
+  type ToolAgg = { calls: number; errors: number; denials: number }
+  const toolTotals: Record<string, ToolAgg> = {}
   for (const project of projects) {
     for (const session of project.sessions) {
       for (const [tool, data] of Object.entries(session.toolBreakdown)) {
         if (filterPrefix) { if (!tool.startsWith(filterPrefix)) continue } else { if (tool.startsWith('lang:')) continue }
-        toolTotals[tool] = (toolTotals[tool] ?? 0) + data.calls
+        const agg = toolTotals[tool] ?? { calls: 0, errors: 0, denials: 0 }
+        agg.calls += data.calls
+        agg.errors += data.errors ?? 0
+        agg.denials += data.denials ?? 0
+        toolTotals[tool] = agg
       }
     }
   }
-  const sorted = Object.entries(toolTotals).sort(([, a], [, b]) => b - a)
-  const maxCalls = sorted[0]?.[1] ?? 0
-  const nw = Math.max(6, pw - bw - 15)
+  const sorted = Object.entries(toolTotals).sort(([, a], [, b]) => b.calls - a.calls)
+  const maxCalls = sorted[0]?.[1].calls ?? 0
+  const showErrors = !filterPrefix && sorted.some(([, a]) => a.errors > 0 || a.denials > 0)
+  const callsCol = 7
+  const errCol = showErrors ? 6 : 0
+  const errPctCol = showErrors ? 6 : 0
+  const nw = Math.max(6, pw - bw - 1 - callsCol - errCol - errPctCol - PANEL_CHROME)
   return (
     <Panel title={title ?? 'Core Tools'} color={PANEL_COLORS.tools} width={pw}>
-      <Text dimColor wrap="truncate-end">{''.padEnd(bw + 1 + nw)}{'calls'.padStart(7)}</Text>
-      {sorted.slice(0, 10).map(([tool, calls]) => {
+      <Text dimColor wrap="truncate-end">
+        {''.padEnd(bw + 1 + nw)}{'calls'.padStart(callsCol)}
+        {showErrors ? 'errs'.padStart(errCol) : ''}
+        {showErrors ? 'err%'.padStart(errPctCol) : ''}
+      </Text>
+      {sorted.slice(0, 10).map(([tool, agg]) => {
         const raw = filterPrefix ? tool.slice(filterPrefix.length) : tool
         const display = filterPrefix ? (LANG_DISPLAY_NAMES[raw] ?? raw) : raw
+        const errPct = agg.calls > 0 ? Math.round((agg.errors / agg.calls) * 100) : 0
+        const errColor = errPct >= 25 ? '#F55B5B' : errPct >= 10 ? ORANGE : DIM
         return (
           <Text key={tool} wrap="truncate-end">
-            <HBar value={calls} max={maxCalls} width={bw} />
+            <HBar value={agg.calls} max={maxCalls} width={bw} />
             <Text> {fit(display, nw)}</Text>
-            <Text>{String(calls).padStart(7)}</Text>
+            <Text>{String(agg.calls).padStart(callsCol)}</Text>
+            {showErrors && <Text color={errColor}>{String(agg.errors).padStart(errCol)}</Text>}
+            {showErrors && <Text color={errColor}>{(agg.errors > 0 ? `${errPct}%` : '-').padStart(errPctCol)}</Text>}
           </Text>
         )
       })}
+    </Panel>
+  )
+}
+
+function ErrorBreakdown({ projects, pw, bw }: { projects: ProjectSummary[]; pw: number; bw: number }) {
+  const patterns = new Map<string, { tool: string; signature: string; count: number; example: string }>()
+  const projectDenials: Array<{ project: string; denials: number; calls: number }> = []
+  let totalCalls = 0
+  let totalErrors = 0
+  let totalDenials = 0
+  let totalSiblingCascade = 0
+  for (const project of projects) {
+    let projDenials = 0
+    let projCalls = 0
+    for (const session of project.sessions) {
+      for (const data of Object.values(session.toolBreakdown)) {
+        totalCalls += data.calls
+        totalErrors += data.errors ?? 0
+        totalDenials += data.denials ?? 0
+        totalSiblingCascade += data.siblingCascadeErrors ?? 0
+        projCalls += data.calls
+        projDenials += data.denials ?? 0
+      }
+      for (const p of session.errorPatterns ?? []) {
+        const existing = patterns.get(p.signature)
+        if (existing) existing.count += p.count
+        else patterns.set(p.signature, { ...p })
+      }
+    }
+    if (projDenials > 0) projectDenials.push({ project: project.project, denials: projDenials, calls: projCalls })
+  }
+  if (totalErrors === 0 && totalDenials === 0) return null
+  const sorted = [...patterns.values()].sort((a, b) => b.count - a.count).slice(0, 8)
+  const maxCount = sorted[0]?.count ?? 0
+  const cascadeShare = totalErrors > 0 ? Math.round((totalSiblingCascade / totalErrors) * 100) : 0
+  const errRate = totalCalls > 0 ? ((totalErrors / totalCalls) * 100).toFixed(1) : '0.0'
+  const countCol = 6
+  const nw = Math.max(8, pw - bw - 1 - countCol - PANEL_CHROME)
+  const denialProjects = projectDenials.sort((a, b) => b.denials - a.denials).slice(0, 5)
+  const maxProjDenials = denialProjects[0]?.denials ?? 0
+  return (
+    <Panel title="Tool Errors" color={PANEL_COLORS.errors} width={pw}>
+      <Text dimColor wrap="truncate-end">
+        {`${totalErrors} errors (${errRate}%)  ${totalDenials} denials  ${totalSiblingCascade} sibling-cascade (${cascadeShare}% wasted)`}
+      </Text>
+      {sorted.length > 0 && (
+        <Text dimColor wrap="truncate-end">{''.padEnd(bw + 1 + nw)}{'count'.padStart(countCol)}</Text>
+      )}
+      {sorted.map(p => (
+        <Text key={p.signature} wrap="truncate-end">
+          <HBar value={p.count} max={maxCount} width={bw} />
+          <Text> {fit(`${p.tool}: ${p.example}`, nw)}</Text>
+          <Text color={p.count >= 50 ? '#F55B5B' : ORANGE}>{String(p.count).padStart(countCol)}</Text>
+        </Text>
+      ))}
+      {denialProjects.length > 0 && (
+        <>
+          <Text dimColor wrap="truncate-end">{`Denials by project${''.padEnd(Math.max(0, bw + 1 + nw - 'Denials by project'.length))}${'rate'.padStart(countCol)}`}</Text>
+          {denialProjects.map(p => {
+            const rate = p.calls > 0 ? ((p.denials / p.calls) * 100).toFixed(1) + '%' : '-'
+            return (
+              <Text key={p.project} wrap="truncate-end">
+                <HBar value={p.denials} max={maxProjDenials} width={bw} />
+                <Text> {fit(`${shortProject(p.project)} (${p.denials})`, nw)}</Text>
+                <Text color={ORANGE}>{rate.padStart(countCol)}</Text>
+              </Text>
+            )
+          })}
+        </>
+      )}
     </Panel>
   )
 }
@@ -441,7 +530,8 @@ function TopSessions({ projects, pw, bw }: { projects: ProjectSummary[]; pw: num
         const date = session.firstTimestamp
           ? session.firstTimestamp.slice(0, TOP_SESSIONS_DATE_LEN)
           : '----------'
-        const label = `${date} ${shortProject(session.projectName)}`
+        const branchSuffix = session.gitBranch ? ` ⎇ ${session.gitBranch}` : ''
+        const label = `${date} ${shortProject(session.projectName)}${branchSuffix}`
         return (
           <Text key={`${session.sessionId}-${i}`} wrap="truncate-end">
             <HBar value={session.totalCostUSD} max={maxCost} width={bw} />
@@ -451,6 +541,40 @@ function TopSessions({ projects, pw, bw }: { projects: ProjectSummary[]; pw: num
           </Text>
         )
       })}
+    </Panel>
+  )
+}
+
+function BranchActivityBreakdown({ projects, pw, bw, branchLabels }: { projects: ProjectSummary[]; pw: number; bw: number; branchLabels: Record<string, string> }) {
+  const totals: Record<string, { cost: number; sessions: number }> = {}
+  let anyBranch = false
+  for (const project of projects) {
+    for (const session of project.sessions) {
+      if (!session.gitBranch) continue
+      anyBranch = true
+      const label = getBranchLabel(session.gitBranch, branchLabels) ?? 'Other'
+      totals[label] = totals[label] ?? { cost: 0, sessions: 0 }
+      totals[label].cost += session.totalCostUSD
+      totals[label].sessions++
+    }
+  }
+  if (!anyBranch) return null
+  const sorted = Object.entries(totals).sort(([, a], [, b]) => b.cost - a.cost)
+  const maxCost = sorted[0]?.[1].cost ?? 0
+  const costCol = 8
+  const sessCol = 6
+  const nw = Math.max(8, pw - bw - 1 - costCol - sessCol - PANEL_CHROME)
+  return (
+    <Panel title="By Branch" color={PANEL_COLORS.activity} width={pw}>
+      <Text dimColor wrap="truncate-end">{''.padEnd(bw + 1 + nw)}{'cost'.padStart(costCol)}{'sess'.padStart(sessCol)}</Text>
+      {sorted.map(([label, agg]) => (
+        <Text key={label} wrap="truncate-end">
+          <HBar value={agg.cost} max={maxCost} width={bw} />
+          <Text> {fit(label, nw)}</Text>
+          <Text color={GOLD}>{formatCost(agg.cost).padStart(costCol)}</Text>
+          <Text>{String(agg.sessions).padStart(sessCol)}</Text>
+        </Text>
+      ))}
     </Panel>
   )
 }
@@ -599,7 +723,7 @@ function Row({ wide, width, children }: { wide: boolean; width: number; children
   return <>{children}</>
 }
 
-function DashboardContent({ projects, period, columns, activeProvider, budgets, planUsage }: { projects: ProjectSummary[]; period: Period; columns?: number; activeProvider?: string; budgets?: Map<string, ContextBudget>; planUsage?: PlanUsage }) {
+function DashboardContent({ projects, period, columns, activeProvider, budgets, planUsage, branchLabels }: { projects: ProjectSummary[]; period: Period; columns?: number; activeProvider?: string; budgets?: Map<string, ContextBudget>; planUsage?: PlanUsage; branchLabels?: Record<string, string> }) {
   const { dashWidth, wide, halfWidth, barWidth } = getLayout(columns)
   const isCursor = activeProvider === 'cursor'
   if (projects.length === 0) return <Panel title="CodeBurn" color={ORANGE} width={dashWidth}><Text dimColor>No usage data found for {PERIOD_LABELS[period]}.</Text></Panel>
@@ -611,16 +735,17 @@ function DashboardContent({ projects, period, columns, activeProvider, budgets, 
       <Row wide={wide} width={dashWidth}><DailyActivity projects={projects} days={days} pw={pw} bw={barWidth} /><ProjectBreakdown projects={projects} pw={pw} bw={barWidth} budgets={budgets} /></Row>
       <TopSessions projects={projects} pw={dashWidth} bw={barWidth} />
       <Row wide={wide} width={dashWidth}><ActivityBreakdown projects={projects} pw={pw} bw={barWidth} /><ModelBreakdown projects={projects} pw={pw} bw={barWidth} /></Row>
+      <BranchActivityBreakdown projects={projects} pw={dashWidth} bw={barWidth} branchLabels={branchLabels ?? {}} />
       {isCursor ? (
         <ToolBreakdown projects={projects} pw={dashWidth} bw={barWidth} title="Languages" filterPrefix="lang:" />
       ) : (
-        <><Row wide={wide} width={dashWidth}><ToolBreakdown projects={projects} pw={pw} bw={barWidth} /><BashBreakdown projects={projects} pw={pw} bw={barWidth} /></Row><McpBreakdown projects={projects} pw={dashWidth} bw={barWidth} /></>
+        <><Row wide={wide} width={dashWidth}><ToolBreakdown projects={projects} pw={pw} bw={barWidth} /><BashBreakdown projects={projects} pw={pw} bw={barWidth} /></Row><ErrorBreakdown projects={projects} pw={dashWidth} bw={barWidth} /><McpBreakdown projects={projects} pw={dashWidth} bw={barWidth} /></>
       )}
     </Box>
   )
 }
 
-function InteractiveDashboard({ initialProjects, initialPeriod, initialProvider, initialPlanUsage, refreshSeconds, projectFilter, excludeFilter }: {
+function InteractiveDashboard({ initialProjects, initialPeriod, initialProvider, initialPlanUsage, refreshSeconds, projectFilter, excludeFilter, branchLabels }: {
   initialProjects: ProjectSummary[]
   initialPeriod: Period
   initialProvider: string
@@ -628,6 +753,7 @@ function InteractiveDashboard({ initialProjects, initialPeriod, initialProvider,
   refreshSeconds?: number
   projectFilter?: string[]
   excludeFilter?: string[]
+  branchLabels?: Record<string, string>
 }) {
   const { exit } = useApp()
   const [period, setPeriod] = useState<Period>(initialPeriod)
@@ -782,19 +908,19 @@ function InteractiveDashboard({ initialProjects, initialPeriod, initialProvider,
         ? <CompareView projects={projects} onBack={() => setView('dashboard')} />
         : view === 'optimize' && optimizeResult
           ? <OptimizeView findings={optimizeResult.findings} costRate={optimizeResult.costRate} projects={projects} label={PERIOD_LABELS[period]} width={dashWidth} healthScore={optimizeResult.healthScore} healthGrade={optimizeResult.healthGrade} />
-          : <DashboardContent projects={projects} period={period} columns={columns} activeProvider={activeProvider} budgets={projectBudgets} planUsage={planUsage} />}
+          : <DashboardContent projects={projects} period={period} columns={columns} activeProvider={activeProvider} budgets={projectBudgets} planUsage={planUsage} branchLabels={branchLabels} />}
       {view !== 'compare' && <StatusBar width={dashWidth} showProvider={multipleProviders} view={view} findingCount={findingCount} optimizeAvailable={optimizeAvailable} compareAvailable={compareAvailable} />}
     </Box>
   )
 }
 
-function StaticDashboard({ projects, period, activeProvider, planUsage }: { projects: ProjectSummary[]; period: Period; activeProvider?: string; planUsage?: PlanUsage }) {
+function StaticDashboard({ projects, period, activeProvider, planUsage, branchLabels }: { projects: ProjectSummary[]; period: Period; activeProvider?: string; planUsage?: PlanUsage; branchLabels?: Record<string, string> }) {
   const { columns } = useWindowSize()
   const { dashWidth } = getLayout(columns)
   return (
     <Box flexDirection="column" width={dashWidth}>
       <PeriodTabs active={period} />
-      <DashboardContent projects={projects} period={period} columns={columns} activeProvider={activeProvider} planUsage={planUsage} />
+      <DashboardContent projects={projects} period={period} columns={columns} activeProvider={activeProvider} planUsage={planUsage} branchLabels={branchLabels} />
     </Box>
   )
 }
@@ -804,14 +930,15 @@ export async function renderDashboard(period: Period = 'week', provider: string 
   const range = customRange ?? getDateRange(period)
   const filteredProjects = filterProjectsByName(await parseAllSessions(range, provider), projectFilter, excludeFilter)
   const planUsage = await getPlanUsageOrNull()
+  const branchLabels = resolveBranchLabels(await readConfig())
   const isTTY = process.stdin.isTTY && process.stdout.isTTY
   if (isTTY) {
     const { waitUntilExit } = render(
-      <InteractiveDashboard initialProjects={filteredProjects} initialPeriod={period} initialProvider={provider} initialPlanUsage={planUsage ?? undefined} refreshSeconds={refreshSeconds} projectFilter={projectFilter} excludeFilter={excludeFilter} />
+      <InteractiveDashboard initialProjects={filteredProjects} initialPeriod={period} initialProvider={provider} initialPlanUsage={planUsage ?? undefined} refreshSeconds={refreshSeconds} projectFilter={projectFilter} excludeFilter={excludeFilter} branchLabels={branchLabels} />
     )
     await waitUntilExit()
   } else {
-    const { unmount } = render(<StaticDashboard projects={filteredProjects} period={period} activeProvider={provider} planUsage={planUsage ?? undefined} />, { patchConsole: false })
+    const { unmount } = render(<StaticDashboard projects={filteredProjects} period={period} activeProvider={provider} planUsage={planUsage ?? undefined} branchLabels={branchLabels} />, { patchConsole: false })
     unmount()
   }
 }

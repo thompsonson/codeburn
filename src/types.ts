@@ -101,6 +101,20 @@ export type ClassifiedTurn = ParsedTurn & {
   hasEdits: boolean
 }
 
+export type ToolCallStats = {
+  calls: number
+  errors?: number
+  denials?: number
+  siblingCascadeErrors?: number
+}
+
+export type ToolErrorPattern = {
+  tool: string
+  signature: string
+  count: number
+  example: string
+}
+
 export type SessionSummary = {
   sessionId: string
   project: string
@@ -114,10 +128,12 @@ export type SessionSummary = {
   apiCalls: number
   turns: ClassifiedTurn[]
   modelBreakdown: Record<string, { calls: number; costUSD: number; tokens: TokenUsage }>
-  toolBreakdown: Record<string, { calls: number }>
+  toolBreakdown: Record<string, ToolCallStats>
   mcpBreakdown: Record<string, { calls: number }>
   bashBreakdown: Record<string, { calls: number }>
   categoryBreakdown: Record<TaskCategory, { turns: number; costUSD: number; retries: number; editTurns: number; oneShotTurns: number }>
+  errorPatterns?: ToolErrorPattern[]
+  gitBranch?: string
 }
 
 export type ProjectSummary = {
