@@ -947,4 +947,57 @@ program
     console.log(formatYieldSummary(summary))
   })
 
+const db = program.command('db').description('SQLite store: persist sessions for cross-machine merge')
+
+db
+  .command('ingest')
+  .description('Ingest Claude sessions into the local SQLite store')
+  .option('--db <path>', 'Database path (defaults to ~/.codeburn/usage.db)')
+  .option('--since <period>', 'Only ingest files modified since: today, week, 30days, month, all, or Nd', 'all')
+  .option('--provider <provider>', 'Provider filter (claude only for v1)', 'claude')
+  .option('--project <name>', 'Include only projects matching name (repeatable)', collect, [])
+  .option('--exclude <name>', 'Exclude projects matching name (repeatable)', collect, [])
+  .action(async (opts: { db?: string; since: string; provider: string; project: string[]; exclude: string[] }) => {
+    const { ingestClaudeSessions, resolveMachineId } = await import('./storage/ingest.js')
+    const { openStore } = await import('./storage/sqlite-store.js')
+    const { getDefaultDbPath } = await import('./storage/paths.js')
+
+    await loadPricing()
+    const config = await readConfig()
+    const machineId = resolveMachineId(config)
+    const dbPath = opts.db ?? getDefaultDbPath()
+
+    let sinceMtimeMs: number | undefined
+    try {
+      const range = parseSinceArg(opts.since)
+      sinceMtimeMs = range?.start.getTime()
+    } catch (err) {
+      console.error(`\n  ${err instanceof Error ? err.message : String(err)}\n`)
+      process.exit(1)
+    }
+
+    const store = await openStore(dbPath)
+    try {
+      console.log(`\n  Ingesting to ${dbPath} (machine_id=${machineId})...`)
+      const result = await ingestClaudeSessions({
+        store,
+        machineId,
+        providerFilter: opts.provider,
+        projectFilter: opts.project,
+        excludeFilter: opts.exclude,
+        sinceMtimeMs,
+      })
+      console.log(`  Files scanned:    ${result.filesScanned}`)
+      console.log(`  Skipped unchanged: ${result.filesSkippedUnchanged}`)
+      console.log(`  Sessions written: ${result.sessionsWritten}`)
+      console.log(`  New events:       ${result.eventsInserted}\n`)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      console.error(`\n  Ingest failed: ${message}\n`)
+      process.exitCode = 1
+    } finally {
+      store.close()
+    }
+  })
+
 program.parse()
