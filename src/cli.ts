@@ -1,6 +1,7 @@
 import { Command } from 'commander'
 import { installMenubarApp } from './menubar-installer.js'
 import { exportCsv, exportJson, type PeriodExport } from './export.js'
+import { exportEvents } from './event-export.js'
 import { loadPricing, setModelAliases } from './models.js'
 import { parseAllSessions, filterProjectsByName } from './parser.js'
 import { convertCost } from './currency.js'
@@ -84,6 +85,27 @@ function toPeriod(s: string): Period {
 function collect(val: string, acc: string[]): string[] {
   acc.push(val)
   return acc
+}
+
+// Accepts the named periods (today/week/30days/month/all) plus shorthand `Nd`
+// for an N-day window. Returns null only on `--since all` (so callers know to
+// skip the date filter); throws on unparseable input.
+function parseSinceArg(value: string): DateRange | null {
+  if (value === 'all') return null
+  const dayMatch = /^(\d+)d$/.exec(value)
+  if (dayMatch) {
+    const days = Number(dayMatch[1])
+    const now = new Date()
+    return {
+      start: new Date(now.getFullYear(), now.getMonth(), now.getDate() - days),
+      end: new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999),
+    }
+  }
+  const named: Record<string, true> = { today: true, week: true, '30days': true, month: true }
+  if (!named[value]) {
+    throw new Error(`unknown --since value '${value}' (expected today, week, 30days, month, all, or e.g. 7d)`)
+  }
+  return getDateRange(value).range
 }
 
 function parseNumber(value: string): number {
@@ -588,14 +610,37 @@ program
 
 program
   .command('export')
-  .description('Export usage data to CSV or JSON (includes 1 day, 7 days, 30 days)')
-  .option('-f, --format <format>', 'Export format: csv, json', 'csv')
+  .description('Export usage data to CSV, JSON, or per-session tool-event JSONL')
+  .option('-f, --format <format>', 'Export format: csv, json, jsonl', 'csv')
   .option('-o, --output <path>', 'Output file path')
   .option('--provider <provider>', 'Filter by provider: all, claude, codex, cursor', 'all')
   .option('--project <name>', 'Show only projects matching name (repeatable)', collect, [])
   .option('--exclude <name>', 'Exclude projects matching name (repeatable)', collect, [])
+  .option('--since <period>', 'jsonl only: today, week, 30days, month, all, or Nd (default 30days)', '30days')
   .action(async (opts) => {
     await loadPricing()
+    const config = await readConfig()
+
+    if (opts.format === 'jsonl') {
+      const range = parseSinceArg(opts.since)
+      const defaultName = `codeburn-events-${toDateString(new Date())}`
+      const outputPath = opts.output ?? `${defaultName}.jsonl`
+      try {
+        const result = await exportEvents({
+          outputPath,
+          dateRange: range ?? undefined,
+          projectFilter: opts.project,
+          excludeFilter: opts.exclude,
+        })
+        console.log(`\n  Exported ${result.eventCount} events from ${result.sessionCount} sessions to: ${result.path}\n`)
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        console.error(`\n  Export failed: ${message}\n`)
+        process.exit(1)
+      }
+      return
+    }
+
     const pf = opts.provider
     const fp = (p: ProjectSummary[]) => filterProjectsByName(p, opts.project, opts.exclude)
     const periods: PeriodExport[] = [
@@ -612,7 +657,6 @@ program
     const defaultName = `codeburn-${toDateString(new Date())}`
     const outputPath = opts.output ?? `${defaultName}.${opts.format}`
 
-    const config = await readConfig()
     let savedPath: string
     try {
       if (opts.format === 'json') {
