@@ -21,6 +21,7 @@ export type CodeburnConfig = {
   plan?: Plan
   modelAliases?: Record<string, string>
   branchLabels?: Record<string, string>
+  machineId?: string
 }
 
 const DEFAULT_BRANCH_LABELS: Record<string, string> = {

@@ -14,10 +14,34 @@ export type SqliteDatabase = {
   close(): void
 }
 
-type DatabaseSyncCtor = new (path: string, options?: { readOnly?: boolean }) => {
-  prepare(sql: string): { all(...params: unknown[]): Row[] }
+export type RunResult = { changes: number; lastInsertRowid: number | bigint }
+
+export type SqliteStatement = {
+  all<T extends Row = Row>(...params: unknown[]): T[]
+  get<T extends Row = Row>(...params: unknown[]): T | undefined
+  run(...params: unknown[]): RunResult
+}
+
+export type WritableSqliteDatabase = SqliteDatabase & {
+  exec(sql: string): void
+  run(sql: string, params?: unknown[]): RunResult
+  prepare(sql: string): SqliteStatement
+  transaction<T>(fn: () => T): T
+}
+
+type DriverStatement = {
+  all(...params: unknown[]): Row[]
+  get(...params: unknown[]): Row | undefined
+  run(...params: unknown[]): RunResult
+}
+
+type DriverDatabase = {
+  prepare(sql: string): DriverStatement
+  exec(sql: string): void
   close(): void
 }
+
+type DatabaseSyncCtor = new (path: string, options?: { readOnly?: boolean }) => DriverDatabase
 
 let DatabaseSync: DatabaseSyncCtor | null = null
 let loadAttempted = false
@@ -93,6 +117,55 @@ export function openDatabase(path: string): SqliteDatabase {
   return {
     query<T extends Row = Row>(sql: string, params: unknown[] = []): T[] {
       return db.prepare(sql).all(...params) as T[]
+    },
+    close() {
+      db.close()
+    },
+  }
+}
+
+export function openDatabaseWrite(path: string): WritableSqliteDatabase {
+  if (!loadDriver() || DatabaseSync === null) {
+    throw new Error(getSqliteLoadError())
+  }
+
+  const db = new DatabaseSync(path, { readOnly: false })
+
+  const wrap = (stmt: DriverStatement): SqliteStatement => ({
+    all<T extends Row = Row>(...params: unknown[]): T[] {
+      return stmt.all(...params) as T[]
+    },
+    get<T extends Row = Row>(...params: unknown[]): T | undefined {
+      return stmt.get(...params) as T | undefined
+    },
+    run(...params: unknown[]): RunResult {
+      return stmt.run(...params)
+    },
+  })
+
+  return {
+    query<T extends Row = Row>(sql: string, params: unknown[] = []): T[] {
+      return db.prepare(sql).all(...params) as T[]
+    },
+    exec(sql: string): void {
+      db.exec(sql)
+    },
+    run(sql: string, params: unknown[] = []): RunResult {
+      return db.prepare(sql).run(...params)
+    },
+    prepare(sql: string): SqliteStatement {
+      return wrap(db.prepare(sql))
+    },
+    transaction<T>(fn: () => T): T {
+      db.exec('BEGIN')
+      try {
+        const result = fn()
+        db.exec('COMMIT')
+        return result
+      } catch (err) {
+        db.exec('ROLLBACK')
+        throw err
+      }
     },
     close() {
       db.close()
