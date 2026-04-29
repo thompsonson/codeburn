@@ -378,15 +378,25 @@ async function parseSessionFile(
   if (entries.length === 0) return null
 
   const sessionId = basename(filePath, '.jsonl')
+  return parseSessionEntries(sessionId, project, entries, seenMsgIds, dateRange)
+}
+
+// Build a SessionSummary from already-parsed JSONL entries. Same logic as
+// parseSessionFile after the file has been read; exposed so the SQLite ingest
+// pipeline can reuse it without re-walking the file.
+export function parseSessionEntries(
+  sessionId: string,
+  project: string,
+  entries: JournalEntry[],
+  seenMsgIds?: Set<string>,
+  dateRange?: DateRange,
+): SessionSummary | null {
+  if (entries.length === 0) return null
+  const seen = seenMsgIds ?? new Set<string>()
   const toolErrors = extractToolErrors(entries)
   const gitBranch = entries.reduce<string | undefined>((acc, e) => e.gitBranch || acc, undefined)
-  let turns = groupIntoTurns(entries, seenMsgIds)
+  let turns = groupIntoTurns(entries, seen)
   if (dateRange) {
-    // Bucket a turn by the timestamp of its first assistant call (when the cost was
-    // actually incurred). Filtering entries directly produced orphan assistant calls
-    // when a user message sat in one day and the response landed in another -- those
-    // got pushed as turns with empty timestamps, which some code paths counted and
-    // others dropped, producing inconsistent Today totals.
     turns = turns.filter(turn => {
       if (turn.assistantCalls.length === 0) return false
       const firstCallTs = turn.assistantCalls[0]!.timestamp
@@ -397,7 +407,6 @@ async function parseSessionFile(
     if (turns.length === 0) return null
   }
   const classified = turns.map(classifyTurn)
-
   return buildSessionSummary(sessionId, project, classified, toolErrors, gitBranch)
 }
 

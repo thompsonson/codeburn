@@ -1,7 +1,12 @@
 import { mkdir } from 'fs/promises'
 import { dirname } from 'path'
 
-import { openDatabaseWrite, type SqliteStatement, type WritableSqliteDatabase } from '../sqlite.js'
+import {
+  openDatabaseWrite,
+  type RunResult,
+  type SqliteStatement,
+  type WritableSqliteDatabase,
+} from '../sqlite.js'
 import { getCurrentVersion, runMigrations, targetVersion } from './migrations.js'
 
 export type SessionRow = {
@@ -69,7 +74,7 @@ export type IngestStateRow = {
 
 export type SqliteStore = {
   upsertSession(row: SessionRow): void
-  insertEventOrIgnore(row: ToolEventRow): void
+  insertEventOrIgnore(row: ToolEventRow): RunResult
   replaceToolBreakdown(machineId: string, sessionId: string, rows: ToolBreakdownRow[]): void
   replaceErrorPatterns(machineId: string, sessionId: string, rows: ErrorPatternRow[]): void
   upsertIngestState(row: IngestStateRow): void
@@ -200,8 +205,8 @@ export async function openStore(path: string): Promise<SqliteStore> {
         row.cacheWrite,
       )
     },
-    insertEventOrIgnore(row) {
-      eventInsert.run(
+    insertEventOrIgnore(row): RunResult {
+      return eventInsert.run(
         row.machineId,
         row.sessionId,
         row.lineNo,
