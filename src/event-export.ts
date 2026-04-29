@@ -142,7 +142,7 @@ export async function exportEvents(opts: ExportEventsOptions): Promise<{ path: s
       const sessionId = basename(filePath, '.jsonl')
       const toolNameById = new Map<string, string>()
       const sameToolStreak: { tool: string | null; index: number } = { tool: null, index: 0 }
-      let pendingDenial: { sessionId: string; project: string; gitBranch?: string; timestamp: string; tool?: string; reason: string } | null = null
+      let pendingDenial: { sessionId: string; project: string; gitBranch?: string; timestamp: string; tool?: string; reason: string; messageId?: string } | null = null
 
       for await (const line of readSessionLines(filePath)) {
         const entry = parseJsonlLine(line)
@@ -207,7 +207,7 @@ export async function exportEvents(opts: ExportEventsOptions): Promise<{ path: s
               // Only watch for a follow-up correction if the denial didn't carry one inline.
               pendingDenial = inlineCorrection
                 ? null
-                : { sessionId, project, gitBranch, timestamp: ts, tool: toolName, reason: text }
+                : { sessionId, project, gitBranch, timestamp: ts, tool: toolName, reason: text, messageId: parentMessageId }
               continue
             }
             const isError = !!b.is_error
@@ -241,6 +241,7 @@ export async function exportEvents(opts: ExportEventsOptions): Promise<{ path: s
             project,
             git_branch: gitBranch,
             event_type: 'correction',
+            message_id: pendingDenial.messageId,
             tool_name: pendingDenial.tool,
             denial_reason: pendingDenial.reason,
             correction_text: truncateCorrectionText(text),

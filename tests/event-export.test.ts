@@ -125,6 +125,7 @@ describe('exportEvents', () => {
     const correction = events.find(e => e.event_type === 'correction')
     expect(correction?.correction_text).toBe('use sed instead')
     expect(correction?.tool_name).toBe('Edit')
+    expect(correction?.message_id).toBe('asst-msg-1')
   })
 
   it('extracts inline correction text from denial tool_result and skips next-message pairing', async () => {
