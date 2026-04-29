@@ -67,6 +67,35 @@ describe('exportEvents', () => {
     expect(readCall?.retry_index).toBe(0)
   })
 
+  it('collects subagent JSONLs under <project>/<subdir>/subagents/', async () => {
+    const subagentDir = join(base, 'projects', PROJECT_NAME, 'agent-1', 'subagents')
+    await mkdir(subagentDir, { recursive: true })
+    const subLine = JSON.stringify({
+      type: 'assistant',
+      sessionId: 'sub-sess',
+      timestamp: '2026-04-16T00:01:00Z',
+      message: {
+        id: 'sub-msg',
+        type: 'message',
+        role: 'assistant',
+        model: 'claude-opus-4-6',
+        content: [{ type: 'tool_use', id: 'sub-bash-1', name: 'Grep', input: { pattern: 'foo' } }],
+        usage: { input_tokens: 1, output_tokens: 1 },
+      },
+    })
+    await writeFile(join(subagentDir, 'sub.jsonl'), subLine + '\n', 'utf-8')
+
+    await exportEvents({ outputPath, dateRange: makeRange() })
+    const lines = (await readFile(outputPath, 'utf-8')).trim().split('\n')
+    const events: ToolEventRecord[] = lines.map(l => JSON.parse(l))
+    const sessionIds = new Set(events.map(e => e.session_id))
+    expect(sessionIds.has('sess')).toBe(true)
+    expect(sessionIds.has('sub')).toBe(true)
+    const grepCall = events.find(e => e.tool_name === 'Grep')
+    expect(grepCall?.event_type).toBe('tool_call')
+    expect(grepCall?.session_id).toBe('sub')
+  })
+
   it('pairs denial with following user correction text', async () => {
     const sessPath = join(base, 'projects', PROJECT_NAME, 'sess.jsonl')
     const original = await readFile(sessPath, 'utf-8')

@@ -134,7 +134,6 @@ export type SessionSummary = {
   categoryBreakdown: Record<TaskCategory, { turns: number; costUSD: number; retries: number; editTurns: number; oneShotTurns: number }>
   errorPatterns?: ToolErrorPattern[]
   gitBranch?: string
-  branchLabel?: string
 }
 
 export type ProjectSummary = {

@@ -438,17 +438,22 @@ function ToolBreakdown({ projects, pw, bw, title, filterPrefix }: { projects: Pr
 
 function ErrorBreakdown({ projects, pw, bw }: { projects: ProjectSummary[]; pw: number; bw: number }) {
   const patterns = new Map<string, { tool: string; signature: string; count: number; example: string }>()
+  const projectDenials: Array<{ project: string; denials: number; calls: number }> = []
   let totalCalls = 0
   let totalErrors = 0
   let totalDenials = 0
   let totalSiblingCascade = 0
   for (const project of projects) {
+    let projDenials = 0
+    let projCalls = 0
     for (const session of project.sessions) {
       for (const data of Object.values(session.toolBreakdown)) {
         totalCalls += data.calls
         totalErrors += data.errors ?? 0
         totalDenials += data.denials ?? 0
         totalSiblingCascade += data.siblingCascadeErrors ?? 0
+        projCalls += data.calls
+        projDenials += data.denials ?? 0
       }
       for (const p of session.errorPatterns ?? []) {
         const existing = patterns.get(p.signature)
@@ -456,6 +461,7 @@ function ErrorBreakdown({ projects, pw, bw }: { projects: ProjectSummary[]; pw: 
         else patterns.set(p.signature, { ...p })
       }
     }
+    if (projDenials > 0) projectDenials.push({ project: project.project, denials: projDenials, calls: projCalls })
   }
   if (totalErrors === 0 && totalDenials === 0) return null
   const sorted = [...patterns.values()].sort((a, b) => b.count - a.count).slice(0, 8)
@@ -464,6 +470,8 @@ function ErrorBreakdown({ projects, pw, bw }: { projects: ProjectSummary[]; pw: 
   const errRate = totalCalls > 0 ? ((totalErrors / totalCalls) * 100).toFixed(1) : '0.0'
   const countCol = 6
   const nw = Math.max(8, pw - bw - 1 - countCol - PANEL_CHROME)
+  const denialProjects = projectDenials.sort((a, b) => b.denials - a.denials).slice(0, 5)
+  const maxProjDenials = denialProjects[0]?.denials ?? 0
   return (
     <Panel title="Tool Errors" color={PANEL_COLORS.errors} width={pw}>
       <Text dimColor wrap="truncate-end">
@@ -479,6 +487,21 @@ function ErrorBreakdown({ projects, pw, bw }: { projects: ProjectSummary[]; pw: 
           <Text color={p.count >= 50 ? '#F55B5B' : ORANGE}>{String(p.count).padStart(countCol)}</Text>
         </Text>
       ))}
+      {denialProjects.length > 0 && (
+        <>
+          <Text dimColor wrap="truncate-end">{`Denials by project${''.padEnd(Math.max(0, bw + 1 + nw - 'Denials by project'.length))}${'rate'.padStart(countCol)}`}</Text>
+          {denialProjects.map(p => {
+            const rate = p.calls > 0 ? ((p.denials / p.calls) * 100).toFixed(1) + '%' : '-'
+            return (
+              <Text key={p.project} wrap="truncate-end">
+                <HBar value={p.denials} max={maxProjDenials} width={bw} />
+                <Text> {fit(`${shortProject(p.project)} (${p.denials})`, nw)}</Text>
+                <Text color={ORANGE}>{rate.padStart(countCol)}</Text>
+              </Text>
+            )
+          })}
+        </>
+      )}
     </Panel>
   )
 }

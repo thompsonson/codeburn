@@ -4,6 +4,13 @@ import { basename, dirname, join, resolve } from 'path'
 
 import { readSessionLines } from './fs-utils.js'
 import { discoverAllSessions } from './providers/index.js'
+import {
+  DENIAL_RE,
+  SIBLING_CASCADE_RE,
+  isToolResultBlock,
+  toolResultText,
+  truncateCorrectionText,
+} from './tool-result-classifier.js'
 import type {
   AssistantMessageContent,
   ContentBlock,
@@ -11,9 +18,6 @@ import type {
   JournalEntry,
   ToolUseBlock,
 } from './types.js'
-
-const SIBLING_CASCADE_RE = /sibling tool call errored/i
-const DENIAL_RE = /(permission denied|doesn['’]t want to proceed|is not allowed by user|tool use was rejected|user rejected the tool call|user (?:has )?denied|tool denied)/i
 
 export type ToolEventRecord = {
   session_id: string
@@ -31,30 +35,6 @@ export type ToolEventRecord = {
   denial_reason?: string
   correction_text?: string
   retry_index?: number
-}
-
-type ToolResultBlock = {
-  type: 'tool_result'
-  tool_use_id?: string
-  is_error?: boolean
-  content?: unknown
-}
-
-function isToolResultBlock(b: unknown): b is ToolResultBlock {
-  return !!b && typeof b === 'object' && (b as { type?: unknown }).type === 'tool_result'
-}
-
-function toolResultText(content: unknown): string {
-  if (typeof content === 'string') return content
-  if (Array.isArray(content)) {
-    return content
-      .filter((b): b is { type: 'text'; text: string } =>
-        !!b && typeof b === 'object' && (b as { type?: unknown }).type === 'text' && typeof (b as { text?: unknown }).text === 'string'
-      )
-      .map(b => b.text)
-      .join('\n')
-  }
-  return ''
 }
 
 function userMessageText(entry: JournalEntry): string {
@@ -252,7 +232,7 @@ export async function exportEvents(opts: ExportEventsOptions): Promise<{ path: s
             event_type: 'correction',
             tool_name: pendingDenial.tool,
             denial_reason: pendingDenial.reason,
-            correction_text: text.length > 4000 ? text.slice(0, 4000) + '…' : text,
+            correction_text: truncateCorrectionText(text),
           })
           pendingDenial = null
         }

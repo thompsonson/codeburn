@@ -75,64 +75,13 @@ function getMessageId(entry: JournalEntry): string | null {
   return msg?.id ?? null
 }
 
-const SIBLING_CASCADE_RE = /sibling tool call errored/i
-// Denial signatures observed in real Claude session JSONLs across permission flows.
-const DENIAL_RE = /(permission denied|doesn['’]t want to proceed|is not allowed by user|tool use was rejected|user rejected the tool call|user (?:has )?denied|tool denied)/i
-
-type ToolResultBlock = {
-  type: 'tool_result'
-  tool_use_id?: string
-  is_error?: boolean
-  content?: unknown
-}
-
-function isToolResultBlock(b: unknown): b is ToolResultBlock {
-  return !!b && typeof b === 'object' && (b as { type?: unknown }).type === 'tool_result'
-}
-
-function toolResultText(content: unknown): string {
-  if (typeof content === 'string') return content
-  if (Array.isArray(content)) {
-    return content
-      .filter((b): b is { type: 'text'; text: string } =>
-        !!b && typeof b === 'object' && (b as { type?: unknown }).type === 'text' && typeof (b as { text?: unknown }).text === 'string'
-      )
-      .map(b => b.text)
-      .join('\n')
-  }
-  return ''
-}
-
-function firstNonEmptyLine(s: string, maxLen = 200): string {
-  for (const raw of s.split('\n')) {
-    const t = raw.trim()
-    if (t) return t.length > maxLen ? t.slice(0, maxLen) + '…' : t
-  }
-  return ''
-}
-
-function errorSignature(tool: string, firstLine: string): string {
-  // Normalize file paths and numbers so unrelated argument values collapse onto one
-  // pattern (e.g. ENOENT on different files becomes a single bucket).
-  const norm = firstLine
-    .replace(/(?:[\w.@~-]+)?\/(?:[^\s/'":]+\/)*[^\s/'":]+/g, '<path>')
-    .replace(/\b\d+\b/g, 'N')
-    .slice(0, 120)
-  return `${tool} | ${norm}`
-}
-
-type ToolEvent = {
-  category: 'error' | 'denial' | 'sibling-cascade'
-  text: string
-}
-
-function classifyToolResult(block: ToolResultBlock): ToolEvent | null {
-  const text = toolResultText(block.content)
-  if (DENIAL_RE.test(text)) return { category: 'denial', text }
-  if (!block.is_error) return null
-  if (SIBLING_CASCADE_RE.test(text)) return { category: 'sibling-cascade', text }
-  return { category: 'error', text }
-}
+import {
+  classifyToolResult,
+  errorSignature,
+  firstNonEmptyLine,
+  isToolResultBlock,
+  type ClassifiedToolEvent,
+} from './tool-result-classifier.js'
 
 type ToolErrorAggregates = {
   perTool: Record<string, { errors: number; denials: number; siblingCascadeErrors: number }>
@@ -143,7 +92,7 @@ function emptyToolErrorAggregates(): ToolErrorAggregates {
   return { perTool: Object.create(null), patterns: new Map() }
 }
 
-function tallyToolEvent(agg: ToolErrorAggregates, tool: string, event: ToolEvent): void {
+function tallyToolEvent(agg: ToolErrorAggregates, tool: string, event: ClassifiedToolEvent): void {
   const stats = agg.perTool[tool] ?? { errors: 0, denials: 0, siblingCascadeErrors: 0 }
   if (event.category === 'denial') stats.denials++
   else if (event.category === 'sibling-cascade') stats.siblingCascadeErrors++
