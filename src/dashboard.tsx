@@ -5,6 +5,7 @@ import { render, Box, Text, useInput, useApp, useWindowSize } from 'ink'
 import { CATEGORY_LABELS, type DateRange, type ProjectSummary, type TaskCategory } from './types.js'
 import { formatCost, formatTokens } from './format.js'
 import { parseAllSessions, filterProjectsByName } from './parser.js'
+import { readConfig, resolveBranchLabels, getBranchLabel } from './config.js'
 import { loadPricing } from './models.js'
 import { getAllProviders } from './providers/index.js'
 import { scanAndDetect, type WasteFinding, type WasteAction, type OptimizeResult } from './optimize.js'
@@ -506,7 +507,8 @@ function TopSessions({ projects, pw, bw }: { projects: ProjectSummary[]; pw: num
         const date = session.firstTimestamp
           ? session.firstTimestamp.slice(0, TOP_SESSIONS_DATE_LEN)
           : '----------'
-        const label = `${date} ${shortProject(session.projectName)}`
+        const branchSuffix = session.gitBranch ? ` ⎇ ${session.gitBranch}` : ''
+        const label = `${date} ${shortProject(session.projectName)}${branchSuffix}`
         return (
           <Text key={`${session.sessionId}-${i}`} wrap="truncate-end">
             <HBar value={session.totalCostUSD} max={maxCost} width={bw} />
@@ -516,6 +518,40 @@ function TopSessions({ projects, pw, bw }: { projects: ProjectSummary[]; pw: num
           </Text>
         )
       })}
+    </Panel>
+  )
+}
+
+function BranchActivityBreakdown({ projects, pw, bw, branchLabels }: { projects: ProjectSummary[]; pw: number; bw: number; branchLabels: Record<string, string> }) {
+  const totals: Record<string, { cost: number; sessions: number }> = {}
+  let anyBranch = false
+  for (const project of projects) {
+    for (const session of project.sessions) {
+      if (!session.gitBranch) continue
+      anyBranch = true
+      const label = getBranchLabel(session.gitBranch, branchLabels) ?? 'Other'
+      totals[label] = totals[label] ?? { cost: 0, sessions: 0 }
+      totals[label].cost += session.totalCostUSD
+      totals[label].sessions++
+    }
+  }
+  if (!anyBranch) return null
+  const sorted = Object.entries(totals).sort(([, a], [, b]) => b.cost - a.cost)
+  const maxCost = sorted[0]?.[1].cost ?? 0
+  const costCol = 8
+  const sessCol = 6
+  const nw = Math.max(8, pw - bw - 1 - costCol - sessCol - PANEL_CHROME)
+  return (
+    <Panel title="By Branch" color={PANEL_COLORS.activity} width={pw}>
+      <Text dimColor wrap="truncate-end">{''.padEnd(bw + 1 + nw)}{'cost'.padStart(costCol)}{'sess'.padStart(sessCol)}</Text>
+      {sorted.map(([label, agg]) => (
+        <Text key={label} wrap="truncate-end">
+          <HBar value={agg.cost} max={maxCost} width={bw} />
+          <Text> {fit(label, nw)}</Text>
+          <Text color={GOLD}>{formatCost(agg.cost).padStart(costCol)}</Text>
+          <Text>{String(agg.sessions).padStart(sessCol)}</Text>
+        </Text>
+      ))}
     </Panel>
   )
 }
@@ -664,7 +700,7 @@ function Row({ wide, width, children }: { wide: boolean; width: number; children
   return <>{children}</>
 }
 
-function DashboardContent({ projects, period, columns, activeProvider, budgets, planUsage }: { projects: ProjectSummary[]; period: Period; columns?: number; activeProvider?: string; budgets?: Map<string, ContextBudget>; planUsage?: PlanUsage }) {
+function DashboardContent({ projects, period, columns, activeProvider, budgets, planUsage, branchLabels }: { projects: ProjectSummary[]; period: Period; columns?: number; activeProvider?: string; budgets?: Map<string, ContextBudget>; planUsage?: PlanUsage; branchLabels?: Record<string, string> }) {
   const { dashWidth, wide, halfWidth, barWidth } = getLayout(columns)
   const isCursor = activeProvider === 'cursor'
   if (projects.length === 0) return <Panel title="CodeBurn" color={ORANGE} width={dashWidth}><Text dimColor>No usage data found for {PERIOD_LABELS[period]}.</Text></Panel>
@@ -676,6 +712,7 @@ function DashboardContent({ projects, period, columns, activeProvider, budgets, 
       <Row wide={wide} width={dashWidth}><DailyActivity projects={projects} days={days} pw={pw} bw={barWidth} /><ProjectBreakdown projects={projects} pw={pw} bw={barWidth} budgets={budgets} /></Row>
       <TopSessions projects={projects} pw={dashWidth} bw={barWidth} />
       <Row wide={wide} width={dashWidth}><ActivityBreakdown projects={projects} pw={pw} bw={barWidth} /><ModelBreakdown projects={projects} pw={pw} bw={barWidth} /></Row>
+      <BranchActivityBreakdown projects={projects} pw={dashWidth} bw={barWidth} branchLabels={branchLabels ?? {}} />
       {isCursor ? (
         <ToolBreakdown projects={projects} pw={dashWidth} bw={barWidth} title="Languages" filterPrefix="lang:" />
       ) : (
@@ -685,7 +722,7 @@ function DashboardContent({ projects, period, columns, activeProvider, budgets, 
   )
 }
 
-function InteractiveDashboard({ initialProjects, initialPeriod, initialProvider, initialPlanUsage, refreshSeconds, projectFilter, excludeFilter }: {
+function InteractiveDashboard({ initialProjects, initialPeriod, initialProvider, initialPlanUsage, refreshSeconds, projectFilter, excludeFilter, branchLabels }: {
   initialProjects: ProjectSummary[]
   initialPeriod: Period
   initialProvider: string
@@ -693,6 +730,7 @@ function InteractiveDashboard({ initialProjects, initialPeriod, initialProvider,
   refreshSeconds?: number
   projectFilter?: string[]
   excludeFilter?: string[]
+  branchLabels?: Record<string, string>
 }) {
   const { exit } = useApp()
   const [period, setPeriod] = useState<Period>(initialPeriod)
@@ -847,19 +885,19 @@ function InteractiveDashboard({ initialProjects, initialPeriod, initialProvider,
         ? <CompareView projects={projects} onBack={() => setView('dashboard')} />
         : view === 'optimize' && optimizeResult
           ? <OptimizeView findings={optimizeResult.findings} costRate={optimizeResult.costRate} projects={projects} label={PERIOD_LABELS[period]} width={dashWidth} healthScore={optimizeResult.healthScore} healthGrade={optimizeResult.healthGrade} />
-          : <DashboardContent projects={projects} period={period} columns={columns} activeProvider={activeProvider} budgets={projectBudgets} planUsage={planUsage} />}
+          : <DashboardContent projects={projects} period={period} columns={columns} activeProvider={activeProvider} budgets={projectBudgets} planUsage={planUsage} branchLabels={branchLabels} />}
       {view !== 'compare' && <StatusBar width={dashWidth} showProvider={multipleProviders} view={view} findingCount={findingCount} optimizeAvailable={optimizeAvailable} compareAvailable={compareAvailable} />}
     </Box>
   )
 }
 
-function StaticDashboard({ projects, period, activeProvider, planUsage }: { projects: ProjectSummary[]; period: Period; activeProvider?: string; planUsage?: PlanUsage }) {
+function StaticDashboard({ projects, period, activeProvider, planUsage, branchLabels }: { projects: ProjectSummary[]; period: Period; activeProvider?: string; planUsage?: PlanUsage; branchLabels?: Record<string, string> }) {
   const { columns } = useWindowSize()
   const { dashWidth } = getLayout(columns)
   return (
     <Box flexDirection="column" width={dashWidth}>
       <PeriodTabs active={period} />
-      <DashboardContent projects={projects} period={period} columns={columns} activeProvider={activeProvider} planUsage={planUsage} />
+      <DashboardContent projects={projects} period={period} columns={columns} activeProvider={activeProvider} planUsage={planUsage} branchLabels={branchLabels} />
     </Box>
   )
 }
@@ -869,14 +907,15 @@ export async function renderDashboard(period: Period = 'week', provider: string 
   const range = customRange ?? getDateRange(period)
   const filteredProjects = filterProjectsByName(await parseAllSessions(range, provider), projectFilter, excludeFilter)
   const planUsage = await getPlanUsageOrNull()
+  const branchLabels = resolveBranchLabels(await readConfig())
   const isTTY = process.stdin.isTTY && process.stdout.isTTY
   if (isTTY) {
     const { waitUntilExit } = render(
-      <InteractiveDashboard initialProjects={filteredProjects} initialPeriod={period} initialProvider={provider} initialPlanUsage={planUsage ?? undefined} refreshSeconds={refreshSeconds} projectFilter={projectFilter} excludeFilter={excludeFilter} />
+      <InteractiveDashboard initialProjects={filteredProjects} initialPeriod={period} initialProvider={provider} initialPlanUsage={planUsage ?? undefined} refreshSeconds={refreshSeconds} projectFilter={projectFilter} excludeFilter={excludeFilter} branchLabels={branchLabels} />
     )
     await waitUntilExit()
   } else {
-    const { unmount } = render(<StaticDashboard projects={filteredProjects} period={period} activeProvider={provider} planUsage={planUsage ?? undefined} />, { patchConsole: false })
+    const { unmount } = render(<StaticDashboard projects={filteredProjects} period={period} activeProvider={provider} planUsage={planUsage ?? undefined} branchLabels={branchLabels} />, { patchConsole: false })
     unmount()
   }
 }

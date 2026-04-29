@@ -612,12 +612,13 @@ program
     const defaultName = `codeburn-${toDateString(new Date())}`
     const outputPath = opts.output ?? `${defaultName}.${opts.format}`
 
+    const config = await readConfig()
     let savedPath: string
     try {
       if (opts.format === 'json') {
-        savedPath = await exportJson(periods, outputPath)
+        savedPath = await exportJson(periods, outputPath, { config })
       } else {
-        savedPath = await exportCsv(periods, outputPath)
+        savedPath = await exportCsv(periods, outputPath, { config })
       }
     } catch (err) {
       // Protection guards in export.ts (symlink refusal, non-codeburn folder refusal, etc.)
