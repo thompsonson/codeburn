@@ -137,21 +137,52 @@ function buildModelRows(projects: ProjectSummary[], period: string): Row[] {
 }
 
 function buildToolRows(projects: ProjectSummary[]): Row[] {
-  const toolTotals: Record<string, number> = {}
+  type ToolAgg = { calls: number; errors: number; denials: number; siblingCascade: number }
+  const toolTotals: Record<string, ToolAgg> = {}
   for (const project of projects) {
     for (const session of project.sessions) {
       for (const [tool, d] of Object.entries(session.toolBreakdown)) {
-        toolTotals[tool] = (toolTotals[tool] ?? 0) + d.calls
+        const agg = toolTotals[tool] ?? { calls: 0, errors: 0, denials: 0, siblingCascade: 0 }
+        agg.calls += d.calls
+        agg.errors += d.errors ?? 0
+        agg.denials += d.denials ?? 0
+        agg.siblingCascade += d.siblingCascadeErrors ?? 0
+        toolTotals[tool] = agg
       }
     }
   }
-  const total = Object.values(toolTotals).reduce((s, n) => s + n, 0)
+  const total = Object.values(toolTotals).reduce((s, d) => s + d.calls, 0)
   return Object.entries(toolTotals)
-    .sort(([, a], [, b]) => b - a)
-    .map(([tool, calls]) => ({
+    .sort(([, a], [, b]) => b.calls - a.calls)
+    .map(([tool, d]) => ({
       Tool: tool,
-      Calls: calls,
-      'Share (%)': pct(calls, total),
+      Calls: d.calls,
+      'Share (%)': pct(d.calls, total),
+      Errors: d.errors,
+      'Error Rate (%)': pct(d.errors, d.calls),
+      Denials: d.denials,
+      'Sibling Cascade Errors': d.siblingCascade,
+    }))
+}
+
+function buildErrorPatternRows(projects: ProjectSummary[]): Row[] {
+  const patterns = new Map<string, { tool: string; signature: string; count: number; example: string }>()
+  for (const project of projects) {
+    for (const session of project.sessions) {
+      for (const p of session.errorPatterns ?? []) {
+        const existing = patterns.get(p.signature)
+        if (existing) existing.count += p.count
+        else patterns.set(p.signature, { ...p })
+      }
+    }
+  }
+  return [...patterns.values()]
+    .sort((a, b) => b.count - a.count)
+    .map(p => ({
+      Tool: p.tool,
+      Count: p.count,
+      Signature: p.signature,
+      Example: p.example,
     }))
 }
 
@@ -249,7 +280,8 @@ function buildReadme(periods: PeriodExport[]): string {
     '  models.csv            Spend per model with token totals and cache usage.',
     '  projects.csv          Spend per project folder (30-day window).',
     '  sessions.csv          One row per session (30-day window) with session IDs and costs.',
-    '  tools.csv             Tool invocations and share (30-day window).',
+    '  tools.csv             Tool invocations, error rate, denials (30-day window).',
+    '  errors.csv            Top tool error patterns with example messages (30-day window).',
     '  shell-commands.csv    Shell commands executed via Bash tool (30-day window).',
     '',
     'Notes',
@@ -318,6 +350,7 @@ export async function exportCsv(periods: PeriodExport[], outputPath: string): Pr
   await writeFile(join(folder, 'projects.csv'), rowsToCsv(buildProjectRows(thirtyDayProjects)), 'utf-8')
   await writeFile(join(folder, 'sessions.csv'), rowsToCsv(buildSessionRows(thirtyDayProjects)), 'utf-8')
   await writeFile(join(folder, 'tools.csv'), rowsToCsv(buildToolRows(thirtyDayProjects)), 'utf-8')
+  await writeFile(join(folder, 'errors.csv'), rowsToCsv(buildErrorPatternRows(thirtyDayProjects)), 'utf-8')
   await writeFile(join(folder, 'shell-commands.csv'), rowsToCsv(buildBashRows(thirtyDayProjects)), 'utf-8')
 
   return folder
@@ -342,6 +375,7 @@ export async function exportJson(periods: PeriodExport[], outputPath: string): P
     projects: buildProjectRows(thirtyDayProjects),
     sessions: buildSessionRows(thirtyDayProjects),
     tools: buildToolRows(thirtyDayProjects),
+    errors: buildErrorPatternRows(thirtyDayProjects),
     shellCommands: buildBashRows(thirtyDayProjects),
   }
 

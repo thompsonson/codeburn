@@ -53,6 +53,7 @@ const PANEL_COLORS = {
   tools: '#5BF5E0',
   mcp: '#F55BE0',
   bash: '#F5A05B',
+  errors: '#F55B5B',
 }
 
 const PROVIDER_COLORS: Record<string, string> = {
@@ -387,32 +388,96 @@ function ActivityBreakdown({ projects, pw, bw }: { projects: ProjectSummary[]; p
 }
 
 function ToolBreakdown({ projects, pw, bw, title, filterPrefix }: { projects: ProjectSummary[]; pw: number; bw: number; title?: string; filterPrefix?: string }) {
-  const toolTotals: Record<string, number> = {}
+  type ToolAgg = { calls: number; errors: number; denials: number }
+  const toolTotals: Record<string, ToolAgg> = {}
   for (const project of projects) {
     for (const session of project.sessions) {
       for (const [tool, data] of Object.entries(session.toolBreakdown)) {
         if (filterPrefix) { if (!tool.startsWith(filterPrefix)) continue } else { if (tool.startsWith('lang:')) continue }
-        toolTotals[tool] = (toolTotals[tool] ?? 0) + data.calls
+        const agg = toolTotals[tool] ?? { calls: 0, errors: 0, denials: 0 }
+        agg.calls += data.calls
+        agg.errors += data.errors ?? 0
+        agg.denials += data.denials ?? 0
+        toolTotals[tool] = agg
       }
     }
   }
-  const sorted = Object.entries(toolTotals).sort(([, a], [, b]) => b - a)
-  const maxCalls = sorted[0]?.[1] ?? 0
-  const nw = Math.max(6, pw - bw - 15)
+  const sorted = Object.entries(toolTotals).sort(([, a], [, b]) => b.calls - a.calls)
+  const maxCalls = sorted[0]?.[1].calls ?? 0
+  const showErrors = !filterPrefix && sorted.some(([, a]) => a.errors > 0 || a.denials > 0)
+  const callsCol = 7
+  const errCol = showErrors ? 6 : 0
+  const errPctCol = showErrors ? 6 : 0
+  const nw = Math.max(6, pw - bw - 1 - callsCol - errCol - errPctCol - PANEL_CHROME)
   return (
     <Panel title={title ?? 'Core Tools'} color={PANEL_COLORS.tools} width={pw}>
-      <Text dimColor wrap="truncate-end">{''.padEnd(bw + 1 + nw)}{'calls'.padStart(7)}</Text>
-      {sorted.slice(0, 10).map(([tool, calls]) => {
+      <Text dimColor wrap="truncate-end">
+        {''.padEnd(bw + 1 + nw)}{'calls'.padStart(callsCol)}
+        {showErrors ? 'errs'.padStart(errCol) : ''}
+        {showErrors ? 'err%'.padStart(errPctCol) : ''}
+      </Text>
+      {sorted.slice(0, 10).map(([tool, agg]) => {
         const raw = filterPrefix ? tool.slice(filterPrefix.length) : tool
         const display = filterPrefix ? (LANG_DISPLAY_NAMES[raw] ?? raw) : raw
+        const errPct = agg.calls > 0 ? Math.round((agg.errors / agg.calls) * 100) : 0
+        const errColor = errPct >= 25 ? '#F55B5B' : errPct >= 10 ? ORANGE : DIM
         return (
           <Text key={tool} wrap="truncate-end">
-            <HBar value={calls} max={maxCalls} width={bw} />
+            <HBar value={agg.calls} max={maxCalls} width={bw} />
             <Text> {fit(display, nw)}</Text>
-            <Text>{String(calls).padStart(7)}</Text>
+            <Text>{String(agg.calls).padStart(callsCol)}</Text>
+            {showErrors && <Text color={errColor}>{String(agg.errors).padStart(errCol)}</Text>}
+            {showErrors && <Text color={errColor}>{(agg.errors > 0 ? `${errPct}%` : '-').padStart(errPctCol)}</Text>}
           </Text>
         )
       })}
+    </Panel>
+  )
+}
+
+function ErrorBreakdown({ projects, pw, bw }: { projects: ProjectSummary[]; pw: number; bw: number }) {
+  const patterns = new Map<string, { tool: string; signature: string; count: number; example: string }>()
+  let totalCalls = 0
+  let totalErrors = 0
+  let totalDenials = 0
+  let totalSiblingCascade = 0
+  for (const project of projects) {
+    for (const session of project.sessions) {
+      for (const data of Object.values(session.toolBreakdown)) {
+        totalCalls += data.calls
+        totalErrors += data.errors ?? 0
+        totalDenials += data.denials ?? 0
+        totalSiblingCascade += data.siblingCascadeErrors ?? 0
+      }
+      for (const p of session.errorPatterns ?? []) {
+        const existing = patterns.get(p.signature)
+        if (existing) existing.count += p.count
+        else patterns.set(p.signature, { ...p })
+      }
+    }
+  }
+  if (totalErrors === 0 && totalDenials === 0) return null
+  const sorted = [...patterns.values()].sort((a, b) => b.count - a.count).slice(0, 8)
+  const maxCount = sorted[0]?.count ?? 0
+  const cascadeShare = totalErrors > 0 ? Math.round((totalSiblingCascade / totalErrors) * 100) : 0
+  const errRate = totalCalls > 0 ? ((totalErrors / totalCalls) * 100).toFixed(1) : '0.0'
+  const countCol = 6
+  const nw = Math.max(8, pw - bw - 1 - countCol - PANEL_CHROME)
+  return (
+    <Panel title="Tool Errors" color={PANEL_COLORS.errors} width={pw}>
+      <Text dimColor wrap="truncate-end">
+        {`${totalErrors} errors (${errRate}%)  ${totalDenials} denials  ${totalSiblingCascade} sibling-cascade (${cascadeShare}% wasted)`}
+      </Text>
+      {sorted.length > 0 && (
+        <Text dimColor wrap="truncate-end">{''.padEnd(bw + 1 + nw)}{'count'.padStart(countCol)}</Text>
+      )}
+      {sorted.map(p => (
+        <Text key={p.signature} wrap="truncate-end">
+          <HBar value={p.count} max={maxCount} width={bw} />
+          <Text> {fit(`${p.tool}: ${p.example}`, nw)}</Text>
+          <Text color={p.count >= 50 ? '#F55B5B' : ORANGE}>{String(p.count).padStart(countCol)}</Text>
+        </Text>
+      ))}
     </Panel>
   )
 }
@@ -614,7 +679,7 @@ function DashboardContent({ projects, period, columns, activeProvider, budgets, 
       {isCursor ? (
         <ToolBreakdown projects={projects} pw={dashWidth} bw={barWidth} title="Languages" filterPrefix="lang:" />
       ) : (
-        <><Row wide={wide} width={dashWidth}><ToolBreakdown projects={projects} pw={pw} bw={barWidth} /><BashBreakdown projects={projects} pw={pw} bw={barWidth} /></Row><McpBreakdown projects={projects} pw={dashWidth} bw={barWidth} /></>
+        <><Row wide={wide} width={dashWidth}><ToolBreakdown projects={projects} pw={pw} bw={barWidth} /><BashBreakdown projects={projects} pw={pw} bw={barWidth} /></Row><ErrorBreakdown projects={projects} pw={dashWidth} bw={barWidth} /><McpBreakdown projects={projects} pw={dashWidth} bw={barWidth} /></>
       )}
     </Box>
   )

@@ -15,6 +15,7 @@ import type {
   ProjectSummary,
   SessionSummary,
   TokenUsage,
+  ToolErrorPattern,
   ToolUseBlock,
 } from './types.js'
 import { classifyTurn, BASH_TOOLS } from './classifier.js'
@@ -72,6 +73,123 @@ function getMessageId(entry: JournalEntry): string | null {
   if (entry.type !== 'assistant') return null
   const msg = entry.message as AssistantMessageContent | undefined
   return msg?.id ?? null
+}
+
+const SIBLING_CASCADE_RE = /sibling tool call errored/i
+// Denial signatures observed in real Claude session JSONLs across permission flows.
+const DENIAL_RE = /(permission denied|doesn['’]t want to proceed|is not allowed by user|tool use was rejected|user rejected the tool call|user (?:has )?denied|tool denied)/i
+
+type ToolResultBlock = {
+  type: 'tool_result'
+  tool_use_id?: string
+  is_error?: boolean
+  content?: unknown
+}
+
+function isToolResultBlock(b: unknown): b is ToolResultBlock {
+  return !!b && typeof b === 'object' && (b as { type?: unknown }).type === 'tool_result'
+}
+
+function toolResultText(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    return content
+      .filter((b): b is { type: 'text'; text: string } =>
+        !!b && typeof b === 'object' && (b as { type?: unknown }).type === 'text' && typeof (b as { text?: unknown }).text === 'string'
+      )
+      .map(b => b.text)
+      .join('\n')
+  }
+  return ''
+}
+
+function firstNonEmptyLine(s: string, maxLen = 200): string {
+  for (const raw of s.split('\n')) {
+    const t = raw.trim()
+    if (t) return t.length > maxLen ? t.slice(0, maxLen) + '…' : t
+  }
+  return ''
+}
+
+function errorSignature(tool: string, firstLine: string): string {
+  // Normalize file paths and numbers so unrelated argument values collapse onto one
+  // pattern (e.g. ENOENT on different files becomes a single bucket).
+  const norm = firstLine
+    .replace(/(?:[\w.@~-]+)?\/(?:[^\s/'":]+\/)*[^\s/'":]+/g, '<path>')
+    .replace(/\b\d+\b/g, 'N')
+    .slice(0, 120)
+  return `${tool} | ${norm}`
+}
+
+type ToolEvent = {
+  category: 'error' | 'denial' | 'sibling-cascade'
+  text: string
+}
+
+function classifyToolResult(block: ToolResultBlock): ToolEvent | null {
+  const text = toolResultText(block.content)
+  if (DENIAL_RE.test(text)) return { category: 'denial', text }
+  if (!block.is_error) return null
+  if (SIBLING_CASCADE_RE.test(text)) return { category: 'sibling-cascade', text }
+  return { category: 'error', text }
+}
+
+type ToolErrorAggregates = {
+  perTool: Record<string, { errors: number; denials: number; siblingCascadeErrors: number }>
+  patterns: Map<string, ToolErrorPattern>
+}
+
+function emptyToolErrorAggregates(): ToolErrorAggregates {
+  return { perTool: Object.create(null), patterns: new Map() }
+}
+
+function tallyToolEvent(agg: ToolErrorAggregates, tool: string, event: ToolEvent): void {
+  const stats = agg.perTool[tool] ?? { errors: 0, denials: 0, siblingCascadeErrors: 0 }
+  if (event.category === 'denial') stats.denials++
+  else if (event.category === 'sibling-cascade') stats.siblingCascadeErrors++
+  else stats.errors++
+  agg.perTool[tool] = stats
+
+  if (event.category === 'denial') return
+  const firstLine = firstNonEmptyLine(event.text)
+  if (!firstLine) return
+  const sig = errorSignature(tool, firstLine)
+  const existing = agg.patterns.get(sig)
+  if (existing) existing.count++
+  else agg.patterns.set(sig, { tool, signature: sig, count: 1, example: firstLine })
+}
+
+function extractToolErrors(entries: JournalEntry[]): ToolErrorAggregates {
+  const agg = emptyToolErrorAggregates()
+  const toolNameById = new Map<string, string>()
+  const seenResultIds = new Set<string>()
+
+  for (const entry of entries) {
+    if (entry.type === 'assistant') {
+      const msg = entry.message as AssistantMessageContent | undefined
+      for (const b of msg?.content ?? []) {
+        if (b.type === 'tool_use') {
+          const tu = b as ToolUseBlock
+          if (tu.id && tu.name) toolNameById.set(tu.id, tu.name)
+        }
+      }
+      continue
+    }
+    if (entry.type !== 'user' || !entry.message) continue
+    const content = (entry.message as { content?: unknown }).content
+    if (!Array.isArray(content)) continue
+    for (const b of content) {
+      if (!isToolResultBlock(b)) continue
+      const id = b.tool_use_id
+      if (!id || seenResultIds.has(id)) continue
+      seenResultIds.add(id)
+      const event = classifyToolResult(b)
+      if (!event) continue
+      const tool = toolNameById.get(id) ?? 'unknown'
+      tallyToolEvent(agg, tool, event)
+    }
+  }
+  return agg
 }
 
 function parseApiCall(entry: JournalEntry): ParsedApiCall | null {
@@ -164,10 +282,14 @@ function groupIntoTurns(entries: JournalEntry[], seenMsgIds: Set<string>): Parse
   return turns
 }
 
+const MAX_ERROR_PATTERNS_PER_SESSION = 20
+
 function buildSessionSummary(
   sessionId: string,
   project: string,
   turns: ClassifiedTurn[],
+  toolErrors?: ToolErrorAggregates,
+  gitBranch?: string,
 ): SessionSummary {
   const modelBreakdown: SessionSummary['modelBreakdown'] = Object.create(null)
   const toolBreakdown: SessionSummary['toolBreakdown'] = Object.create(null)
@@ -240,6 +362,22 @@ function buildSessionSummary(
     }
   }
 
+  if (toolErrors) {
+    for (const [tool, stats] of Object.entries(toolErrors.perTool)) {
+      const entry = toolBreakdown[tool] ?? { calls: 0 }
+      entry.errors = (entry.errors ?? 0) + stats.errors
+      entry.denials = (entry.denials ?? 0) + stats.denials
+      entry.siblingCascadeErrors = (entry.siblingCascadeErrors ?? 0) + stats.siblingCascadeErrors
+      toolBreakdown[tool] = entry
+    }
+  }
+
+  const errorPatterns = toolErrors
+    ? [...toolErrors.patterns.values()]
+        .sort((a, b) => b.count - a.count)
+        .slice(0, MAX_ERROR_PATTERNS_PER_SESSION)
+    : undefined
+
   return {
     sessionId,
     project,
@@ -257,6 +395,8 @@ function buildSessionSummary(
     mcpBreakdown,
     bashBreakdown,
     categoryBreakdown,
+    errorPatterns,
+    gitBranch,
   }
 }
 
@@ -289,6 +429,8 @@ async function parseSessionFile(
   if (entries.length === 0) return null
 
   const sessionId = basename(filePath, '.jsonl')
+  const toolErrors = extractToolErrors(entries)
+  const gitBranch = entries.reduce<string | undefined>((acc, e) => e.gitBranch || acc, undefined)
   let turns = groupIntoTurns(entries, seenMsgIds)
   if (dateRange) {
     // Bucket a turn by the timestamp of its first assistant call (when the cost was
@@ -307,7 +449,7 @@ async function parseSessionFile(
   }
   const classified = turns.map(classifyTurn)
 
-  return buildSessionSummary(sessionId, project, classified)
+  return buildSessionSummary(sessionId, project, classified, toolErrors, gitBranch)
 }
 
 async function collectJsonlFiles(dirPath: string): Promise<string[]> {
