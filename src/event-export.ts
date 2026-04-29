@@ -7,6 +7,7 @@ import { discoverAllSessions } from './providers/index.js'
 import {
   DENIAL_RE,
   SIBLING_CASCADE_RE,
+  extractInlineCorrection,
   isToolResultBlock,
   toolResultText,
   truncateCorrectionText,
@@ -26,6 +27,7 @@ export type ToolEventRecord = {
   git_branch?: string
   model?: string
   event_type: 'tool_call' | 'tool_result' | 'denial' | 'correction'
+  message_id?: string
   tool_use_id?: string
   tool_name?: string
   tool_input?: unknown
@@ -140,7 +142,7 @@ export async function exportEvents(opts: ExportEventsOptions): Promise<{ path: s
       const sessionId = basename(filePath, '.jsonl')
       const toolNameById = new Map<string, string>()
       const sameToolStreak: { tool: string | null; index: number } = { tool: null, index: 0 }
-      let pendingDenial: { sessionId: string; project: string; gitBranch?: string; timestamp: string; tool?: string; reason: string } | null = null
+      let pendingDenial: { sessionId: string; project: string; gitBranch?: string; timestamp: string; tool?: string; reason: string; messageId?: string } | null = null
 
       for await (const line of readSessionLines(filePath)) {
         const entry = parseJsonlLine(line)
@@ -170,6 +172,7 @@ export async function exportEvents(opts: ExportEventsOptions): Promise<{ path: s
               git_branch: gitBranch,
               model: msg.model,
               event_type: 'tool_call',
+              message_id: entry.uuid,
               tool_use_id: tu.id,
               tool_name: tu.name,
               tool_input: tu.input ?? {},
@@ -181,23 +184,30 @@ export async function exportEvents(opts: ExportEventsOptions): Promise<{ path: s
 
         if (entry.type !== 'user' || !entry.message) continue
         const content = (entry.message as { content?: unknown }).content
+        const parentMessageId = entry.parentUuid ?? undefined
         if (Array.isArray(content)) {
           for (const b of content) {
             if (!isToolResultBlock(b)) continue
             const text = toolResultText(b.content)
             const toolName = b.tool_use_id ? toolNameById.get(b.tool_use_id) : undefined
             if (DENIAL_RE.test(text)) {
+              const inlineCorrection = extractInlineCorrection(text)
               await writeRecord({
                 session_id: sessionId,
                 timestamp: ts,
                 project,
                 git_branch: gitBranch,
                 event_type: 'denial',
+                message_id: parentMessageId,
                 tool_use_id: b.tool_use_id,
                 tool_name: toolName,
                 denial_reason: text,
+                correction_text: inlineCorrection ? truncateCorrectionText(inlineCorrection) : undefined,
               })
-              pendingDenial = { sessionId, project, gitBranch, timestamp: ts, tool: toolName, reason: text }
+              // Only watch for a follow-up correction if the denial didn't carry one inline.
+              pendingDenial = inlineCorrection
+                ? null
+                : { sessionId, project, gitBranch, timestamp: ts, tool: toolName, reason: text, messageId: parentMessageId }
               continue
             }
             const isError = !!b.is_error
@@ -210,6 +220,7 @@ export async function exportEvents(opts: ExportEventsOptions): Promise<{ path: s
               project,
               git_branch: gitBranch,
               event_type: 'tool_result',
+              message_id: parentMessageId,
               tool_use_id: b.tool_use_id,
               tool_name: toolName,
               is_error: isError,
@@ -230,6 +241,7 @@ export async function exportEvents(opts: ExportEventsOptions): Promise<{ path: s
             project,
             git_branch: gitBranch,
             event_type: 'correction',
+            message_id: pendingDenial.messageId,
             tool_name: pendingDenial.tool,
             denial_reason: pendingDenial.reason,
             correction_text: truncateCorrectionText(text),

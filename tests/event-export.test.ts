@@ -96,6 +96,18 @@ describe('exportEvents', () => {
     expect(grepCall?.session_id).toBe('sub')
   })
 
+  it('links tool_call and tool_result via message_id from assistant uuid', async () => {
+    await exportEvents({ outputPath, dateRange: makeRange() })
+    const lines = (await readFile(outputPath, 'utf-8')).trim().split('\n')
+    const events: ToolEventRecord[] = lines.map(l => JSON.parse(l))
+    const calls = events.filter(e => e.event_type === 'tool_call')
+    const results = events.filter(e => e.event_type === 'tool_result' || e.event_type === 'denial')
+    expect(calls.length).toBeGreaterThan(0)
+    expect(results.length).toBeGreaterThan(0)
+    for (const c of calls) expect(c.message_id).toBe('asst-msg-1')
+    for (const r of results) expect(r.message_id).toBe('asst-msg-1')
+  })
+
   it('pairs denial with following user correction text', async () => {
     const sessPath = join(base, 'projects', PROJECT_NAME, 'sess.jsonl')
     const original = await readFile(sessPath, 'utf-8')
@@ -113,5 +125,60 @@ describe('exportEvents', () => {
     const correction = events.find(e => e.event_type === 'correction')
     expect(correction?.correction_text).toBe('use sed instead')
     expect(correction?.tool_name).toBe('Edit')
+    expect(correction?.message_id).toBe('asst-msg-1')
+  })
+
+  it('extracts inline correction text from denial tool_result and skips next-message pairing', async () => {
+    const sessPath = join(base, 'projects', PROJECT_NAME, 'sess.jsonl')
+    const inlineDenial = JSON.stringify({
+      type: 'assistant',
+      sessionId: 'inline-test',
+      uuid: 'asst-msg-2',
+      timestamp: '2026-04-16T00:01:00Z',
+      message: {
+        id: 'msg-2',
+        type: 'message',
+        role: 'assistant',
+        model: 'claude-opus-4-6',
+        content: [{ type: 'tool_use', id: 'tu-bash-99', name: 'Bash', input: { command: 'python script.py' } }],
+        usage: { input_tokens: 1, output_tokens: 1 },
+      },
+    })
+    const inlineResult = JSON.stringify({
+      type: 'user',
+      sessionId: 'inline-test',
+      uuid: 'user-res-99',
+      parentUuid: 'asst-msg-2',
+      timestamp: '2026-04-16T00:01:01Z',
+      message: {
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: 'tu-bash-99',
+          is_error: true,
+          content: [{ type: 'text', text: "The user doesn't want to proceed with this tool use. The tool use was rejected. To tell you how to proceed, the user said:\nuse uv run python instead of python" }],
+        }],
+      },
+    })
+    const followup = JSON.stringify({
+      type: 'user',
+      sessionId: 'inline-test',
+      timestamp: '2026-04-16T00:01:02Z',
+      message: { role: 'user', content: 'unrelated follow-up' },
+    })
+    const original = await readFile(sessPath, 'utf-8')
+    await writeFile(sessPath, original + inlineDenial + '\n' + inlineResult + '\n' + followup + '\n', 'utf-8')
+
+    await exportEvents({ outputPath, dateRange: makeRange() })
+    const lines = (await readFile(outputPath, 'utf-8')).trim().split('\n')
+    const events: ToolEventRecord[] = lines.map(l => JSON.parse(l))
+    const denials = events.filter(e => e.event_type === 'denial' && e.tool_use_id === 'tu-bash-99')
+    expect(denials.length).toBe(1)
+    expect(denials[0]!.correction_text).toBe('use uv run python instead of python')
+    expect(denials[0]!.tool_name).toBe('Bash')
+    // Inline correction satisfies the issue's correction_text requirement; no
+    // separate 'correction' event should be paired off the unrelated follow-up.
+    const corrections = events.filter(e => e.event_type === 'correction' && e.tool_name === 'Bash')
+    expect(corrections.length).toBe(0)
   })
 })

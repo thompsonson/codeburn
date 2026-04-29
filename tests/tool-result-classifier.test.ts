@@ -6,6 +6,7 @@ import {
   SIBLING_CASCADE_RE,
   classifyToolResult,
   errorSignature,
+  extractInlineCorrection,
   truncateCorrectionText,
 } from '../src/tool-result-classifier.js'
 
@@ -111,5 +112,30 @@ describe('truncateCorrectionText', () => {
     const text = 'a'.repeat(MAX_CORRECTION_TEXT_LEN + 1)
     const result = truncateCorrectionText(text)
     expect(result.endsWith('…')).toBe(true)
+  })
+})
+
+describe('extractInlineCorrection', () => {
+  it('extracts text after "the user said:" with newline', () => {
+    const text = "The user doesn't want to proceed with this tool use. The tool use was rejected. To tell you how to proceed, the user said:\nuse uv run python instead of python"
+    expect(extractInlineCorrection(text)).toBe('use uv run python instead of python')
+  })
+
+  it('extracts text after "the user said:" with curly apostrophe', () => {
+    const text = "The user doesn’t want to proceed with this tool use. To tell you how to proceed, the user said:\ncan we review on other branches?"
+    expect(extractInlineCorrection(text)).toBe('can we review on other branches?')
+  })
+
+  it('returns undefined when the marker is absent', () => {
+    expect(extractInlineCorrection("The user doesn't want to proceed with this tool use. STOP what you are doing.")).toBeUndefined()
+  })
+
+  it('returns undefined when the marker is present but no text follows', () => {
+    expect(extractInlineCorrection('the user said:\n')).toBeUndefined()
+    expect(extractInlineCorrection('the user said:   ')).toBeUndefined()
+  })
+
+  it('handles inline (no newline) correction text', () => {
+    expect(extractInlineCorrection('the user said: use sed')).toBe('use sed')
   })
 })
