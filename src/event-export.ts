@@ -26,6 +26,7 @@ export type ToolEventRecord = {
   git_branch?: string
   model?: string
   event_type: 'tool_call' | 'tool_result' | 'denial' | 'correction'
+  message_id?: string
   tool_use_id?: string
   tool_name?: string
   tool_input?: unknown
@@ -170,6 +171,7 @@ export async function exportEvents(opts: ExportEventsOptions): Promise<{ path: s
               git_branch: gitBranch,
               model: msg.model,
               event_type: 'tool_call',
+              message_id: entry.uuid,
               tool_use_id: tu.id,
               tool_name: tu.name,
               tool_input: tu.input ?? {},
@@ -181,6 +183,7 @@ export async function exportEvents(opts: ExportEventsOptions): Promise<{ path: s
 
         if (entry.type !== 'user' || !entry.message) continue
         const content = (entry.message as { content?: unknown }).content
+        const parentMessageId = entry.parentUuid ?? undefined
         if (Array.isArray(content)) {
           for (const b of content) {
             if (!isToolResultBlock(b)) continue
@@ -193,6 +196,7 @@ export async function exportEvents(opts: ExportEventsOptions): Promise<{ path: s
                 project,
                 git_branch: gitBranch,
                 event_type: 'denial',
+                message_id: parentMessageId,
                 tool_use_id: b.tool_use_id,
                 tool_name: toolName,
                 denial_reason: text,
@@ -210,6 +214,7 @@ export async function exportEvents(opts: ExportEventsOptions): Promise<{ path: s
               project,
               git_branch: gitBranch,
               event_type: 'tool_result',
+              message_id: parentMessageId,
               tool_use_id: b.tool_use_id,
               tool_name: toolName,
               is_error: isError,

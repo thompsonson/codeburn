@@ -96,6 +96,18 @@ describe('exportEvents', () => {
     expect(grepCall?.session_id).toBe('sub')
   })
 
+  it('links tool_call and tool_result via message_id from assistant uuid', async () => {
+    await exportEvents({ outputPath, dateRange: makeRange() })
+    const lines = (await readFile(outputPath, 'utf-8')).trim().split('\n')
+    const events: ToolEventRecord[] = lines.map(l => JSON.parse(l))
+    const calls = events.filter(e => e.event_type === 'tool_call')
+    const results = events.filter(e => e.event_type === 'tool_result' || e.event_type === 'denial')
+    expect(calls.length).toBeGreaterThan(0)
+    expect(results.length).toBeGreaterThan(0)
+    for (const c of calls) expect(c.message_id).toBe('asst-msg-1')
+    for (const r of results) expect(r.message_id).toBe('asst-msg-1')
+  })
+
   it('pairs denial with following user correction text', async () => {
     const sessPath = join(base, 'projects', PROJECT_NAME, 'sess.jsonl')
     const original = await readFile(sessPath, 'utf-8')
